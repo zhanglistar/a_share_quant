@@ -14,7 +14,7 @@ code,shares,entry_date,position_stage,notes
 
 `position_stage`：
 
-- `half`：已按信号买入目标半仓，后续若突破/站上 MA17 会提示 `BUY_FULL`。
+- `half`：已按信号买入目标半仓，后续若突破/站上 MA17 且满足量能条件，会提示 `BUY_FULL`。
 - `full`：已加到目标满仓。
 
 没有持仓就只保留表头。
@@ -33,6 +33,19 @@ python a_share_macd_ma_strategy.py \
   --realtime
 ```
 
+进攻版可以改用：
+
+```bash
+python a_share_macd_ma_strategy.py \
+  --mode daily \
+  --codes attack \
+  --data-source sina \
+  --start 20260101 \
+  --realtime
+```
+
+进攻版只看高弹性 ETF，建议最多同时持有 1-2 只；如果同一天多个 `BUY_HALF`，优先选择日报里 `rank_score` 更高的。
+
 输出会保存到：
 
 ```text
@@ -41,8 +54,8 @@ signals/YYYYMMDD_daily_signals.csv
 
 ## 动作含义
 
-- `BUY_HALF`：无持仓，低位 MACD 且上穿 MA5，买入目标半仓。
-- `BUY_FULL`：已有半仓，今日突破/站上 MA17，加到目标满仓。
+- `BUY_HALF`：无持仓，低位 MACD、上穿 MA5 且量能不明显缩小，买入目标半仓。默认要求成交量大于 5 日均量的 0.8 倍；严格放量可运行时调高 `--volume-ratio`。
+- `BUY_FULL`：已有半仓，今日突破/站上 MA17 且满足量能条件，加到目标满仓。
 - `SELL_1_3`：低于 MA5 10%，卖出当前持仓 1/3。
 - `SELL_ALL`：跌破 MA17，清仓。
 - `HOLD`：无动作。

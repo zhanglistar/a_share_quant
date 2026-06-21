@@ -56,8 +56,13 @@ class StrategyConfig:
     macd_fast: int = 12
     macd_slow: int = 26
     macd_signal: int = 9
+    volume_window: int = 5
+    volume_ratio: float = 0.8
+    breakout_window: int = 20
+    trailing_stop: float = 0.10
     trend_filter: bool = False
     ma17_exit_days: int = 1
+    strategy: str = "rebound"
 
 
 def normalize_code(code: str) -> str:
@@ -316,9 +321,12 @@ def add_indicators(df: pd.DataFrame, cfg: StrategyConfig | None = None) -> pd.Da
     cfg = cfg or StrategyConfig()
     df = df.copy()
     df["ma5"] = df["close"].rolling(5).mean()
+    df["ma10"] = df["close"].rolling(10).mean()
     df["ma20"] = df["close"].rolling(20).mean()
     df["ma17"] = df["close"].rolling(17).mean()
     df["ma60"] = df["close"].rolling(60).mean()
+    df["high_n"] = df["close"].rolling(cfg.breakout_window).max()
+    df["volume_ma"] = df["volume"].rolling(cfg.volume_window).mean()
     ema_fast = df["close"].ewm(span=cfg.macd_fast, adjust=False).mean()
     ema_slow = df["close"].ewm(span=cfg.macd_slow, adjust=False).mean()
     df["diff"] = ema_fast - ema_slow
@@ -341,12 +349,45 @@ def cross_above_ma5(row: pd.Series, prev: pd.Series) -> bool:
     return bool(prev["close"] <= prev["ma5"] and row["close"] > row["ma5"])
 
 
+def has_volume_breakout(row: pd.Series, cfg: StrategyConfig) -> bool:
+    if pd.isna(row["volume_ma"]) or row["volume_ma"] <= 0:
+        return False
+    return bool(row["volume"] > row["volume_ma"] * cfg.volume_ratio)
+
+
 def passes_trend_filter(row: pd.Series, cfg: StrategyConfig) -> bool:
     if not cfg.trend_filter:
         return True
     if pd.isna(row["ma20"]) or pd.isna(row["ma60"]):
         return False
     return bool(row["close"] > row["ma20"] and row["ma20"] > row["ma60"])
+
+
+def is_breakout_entry(row: pd.Series, prev: pd.Series, cfg: StrategyConfig) -> bool:
+    if pd.isna(row["high_n"]) or pd.isna(row["ma60"]):
+        return False
+    return bool(
+        row["close"] >= row["high_n"]
+        and row["ma5"] > row["ma17"] > row["ma60"]
+        and row["diff"] > row["dea"]
+        and row["macd_hist"] > prev["macd_hist"]
+        and has_volume_breakout(row, cfg)
+    )
+
+
+def is_rebound_entry(row: pd.Series, prev: pd.Series, cfg: StrategyConfig) -> bool:
+    return bool(
+        passes_trend_filter(row, cfg)
+        and cross_above_ma5(row, prev)
+        and has_volume_breakout(row, cfg)
+        and is_low_macd(row, prev, cfg)
+    )
+
+
+def is_entry_signal(row: pd.Series, prev: pd.Series, cfg: StrategyConfig, profile: str) -> bool:
+    if profile == "breakout":
+        return is_breakout_entry(row, prev, cfg)
+    return is_rebound_entry(row, prev, cfg)
 
 
 def buy_shares_for_target(
@@ -387,6 +428,7 @@ def backtest(df: pd.DataFrame, code: str, cfg: StrategyConfig) -> tuple[pd.DataF
     shares = 0
     pending_add_date: pd.Timestamp | None = None
     below_ma17_days = 0
+    peak_price = 0.0
     trades: list[dict[str, object]] = []
     equity_rows: list[dict[str, object]] = []
 
@@ -411,13 +453,38 @@ def backtest(df: pd.DataFrame, code: str, cfg: StrategyConfig) -> tuple[pd.DataF
         action = ""
         reason = ""
         below_ma17_days = below_ma17_days + 1 if shares > 0 and price < row["ma17"] else 0
+        if shares > 0:
+            peak_price = max(peak_price, price)
 
-        if shares > 0 and below_ma17_days >= cfg.ma17_exit_days:
+        if shares > 0 and cfg.strategy == "breakout" and cfg.trailing_stop > 0 and price <= peak_price * (1 - cfg.trailing_stop):
             sell_count = shares
             cash = sell_shares(cash, sell_count, price, cfg)
             shares -= sell_count
             pending_add_date = None
             below_ma17_days = 0
+            peak_price = 0.0
+            action = "SELL_ALL"
+            reason = f"breakout从高点回撤{cfg.trailing_stop:.0%}清仓"
+            trades.append(make_trade(code, date, action, sell_count, price, cash, shares, reason))
+
+        elif shares > 0 and cfg.strategy == "breakout" and price < row["ma10"]:
+            sell_count = shares
+            cash = sell_shares(cash, sell_count, price, cfg)
+            shares -= sell_count
+            pending_add_date = None
+            below_ma17_days = 0
+            peak_price = 0.0
+            action = "SELL_ALL"
+            reason = "breakout跌破MA10清仓"
+            trades.append(make_trade(code, date, action, sell_count, price, cash, shares, reason))
+
+        elif shares > 0 and below_ma17_days >= cfg.ma17_exit_days:
+            sell_count = shares
+            cash = sell_shares(cash, sell_count, price, cfg)
+            shares -= sell_count
+            pending_add_date = None
+            below_ma17_days = 0
+            peak_price = 0.0
             action = "SELL_ALL"
             reason = f"连续{cfg.ma17_exit_days}天跌破MA17清仓"
             trades.append(make_trade(code, date, action, sell_count, price, cash, shares, reason))
@@ -433,26 +500,26 @@ def backtest(df: pd.DataFrame, code: str, cfg: StrategyConfig) -> tuple[pd.DataF
 
         if (
             shares == 0
-            and passes_trend_filter(row, cfg)
-            and cross_above_ma5(row, prev)
-            and is_low_macd(row, prev, cfg)
+            and is_entry_signal(row, prev, cfg, cfg.strategy)
         ):
-            buy_count, cash = buy_shares_for_target(cash, shares, price, 0.5, cfg)
+            target = 1.0 if cfg.strategy == "breakout" else 0.5
+            buy_count, cash = buy_shares_for_target(cash, shares, price, target, cfg)
             if buy_count > 0:
                 shares += buy_count
-                pending_add_date = next_trade_date(df, i)
+                pending_add_date = None if cfg.strategy == "breakout" else next_trade_date(df, i)
                 below_ma17_days = 0
-                action = "BUY_HALF"
-                reason = "低位MACD且上穿MA5"
+                peak_price = price
+                action = "BUY_FULL" if cfg.strategy == "breakout" else "BUY_HALF"
+                reason = "breakout趋势突破买入" if cfg.strategy == "breakout" else "低位MACD且上穿MA5"
                 trades.append(make_trade(code, date, action, buy_count, price, cash, shares, reason))
 
         elif shares > 0 and pending_add_date is not None and date == pending_add_date:
-            if price > row["ma17"]:
+            if price > row["ma17"] and has_volume_breakout(row, cfg):
                 buy_count, cash = buy_shares_for_target(cash, shares, price, 1.0, cfg)
                 if buy_count > 0:
                     shares += buy_count
                     action = "BUY_FULL"
-                    reason = "次日突破MA17"
+                    reason = "次日突破MA17且放量"
                     trades.append(make_trade(code, date, action, buy_count, price, cash, shares, reason))
             pending_add_date = None
 
@@ -467,6 +534,8 @@ def backtest(df: pd.DataFrame, code: str, cfg: StrategyConfig) -> tuple[pd.DataF
                 "ma20": row["ma20"],
                 "ma17": row["ma17"],
                 "ma60": row["ma60"],
+                "volume": row["volume"],
+                "volume_ma": row["volume_ma"],
                 "diff": row["diff"],
                 "dea": row["dea"],
                 "macd_hist": row["macd_hist"],
@@ -515,10 +584,15 @@ def signal_for_latest(df: pd.DataFrame, code: str, cfg: StrategyConfig) -> dict[
     row = df.iloc[-1]
     prev = df.iloc[-2]
     signals: list[str] = []
-    if passes_trend_filter(row, cfg) and cross_above_ma5(row, prev) and is_low_macd(row, prev, cfg):
-        signals.append("BUY_HALF: 低位MACD且价格上穿MA5")
-    if row["close"] > row["ma17"]:
-        signals.append("ADD_OK: 若昨日已半仓，今日突破MA17，可加到满仓")
+    if (
+        passes_trend_filter(row, cfg)
+        and cross_above_ma5(row, prev)
+        and has_volume_breakout(row, cfg)
+        and is_low_macd(row, prev, cfg)
+    ):
+        signals.append("BUY_HALF: 低位MACD且价格上穿MA5并放量")
+    if row["close"] > row["ma17"] and has_volume_breakout(row, cfg):
+        signals.append("ADD_OK: 若昨日已半仓，今日突破MA17且放量，可加到满仓")
     if row["close"] < row["ma5"] * (1 - cfg.ma5_break_ratio):
         signals.append(f"SELL_1_3: 低于MA5 {cfg.ma5_break_ratio:.0%}")
     if row["close"] < row["ma17"]:
@@ -532,6 +606,8 @@ def signal_for_latest(df: pd.DataFrame, code: str, cfg: StrategyConfig) -> dict[
         "diff": round(float(row["diff"]), 4),
         "dea": round(float(row["dea"]), 4),
         "macd_hist": round(float(row["macd_hist"]), 4),
+        "volume": round(float(row["volume"]), 2),
+        "volume_ma": round(float(row["volume_ma"]), 2),
         "signals": " | ".join(signals) if signals else "NO_ACTION",
     }
 
@@ -574,6 +650,8 @@ def daily_action_for_code(
     action = "HOLD"
     reason = "无动作"
     priority = 0
+    volume_strength = 0.0 if pd.isna(row["volume_ma"]) or row["volume_ma"] <= 0 else float(row["volume"] / row["volume_ma"])
+    macd_improve = float(row["macd_hist"] - prev["macd_hist"])
 
     if shares > 0 and row["close"] < row["ma17"]:
         action = "SELL_ALL"
@@ -583,13 +661,24 @@ def daily_action_for_code(
         action = "SELL_1_3"
         reason = f"低于MA5 {cfg.ma5_break_ratio:.0%}，卖出1/3"
         priority = 90
-    elif shares > 0 and stage.lower() in {"half", "buy_half", "50", "0.5"} and row["close"] > row["ma17"]:
+    elif (
+        shares > 0
+        and stage.lower() in {"half", "buy_half", "50", "0.5"}
+        and row["close"] > row["ma17"]
+        and has_volume_breakout(row, cfg)
+    ):
         action = "BUY_FULL"
-        reason = "已半仓且突破MA17，加到目标满仓"
+        reason = "已半仓且突破MA17并满足量能条件，加到目标满仓"
         priority = 80
-    elif shares == 0 and passes_trend_filter(row, cfg) and cross_above_ma5(row, prev) and is_low_macd(row, prev, cfg):
+    elif (
+        shares == 0
+        and passes_trend_filter(row, cfg)
+        and cross_above_ma5(row, prev)
+        and has_volume_breakout(row, cfg)
+        and is_low_macd(row, prev, cfg)
+    ):
         action = "BUY_HALF"
-        reason = "低位MACD且上穿MA5，买入目标半仓"
+        reason = "低位MACD且上穿MA5并放量，买入目标半仓"
         priority = 70
 
     return {
@@ -597,6 +686,7 @@ def daily_action_for_code(
         "date": row["date"].date().isoformat(),
         "action": action,
         "priority": priority,
+        "rank_score": round(priority + max(volume_strength - 1, 0) * 10 + max(macd_improve, 0) * 100, 3),
         "shares": shares,
         "position_stage": stage,
         "price": round(float(row["close"]), 3),
@@ -605,6 +695,9 @@ def daily_action_for_code(
         "diff": round(float(row["diff"]), 4),
         "dea": round(float(row["dea"]), 4),
         "macd_hist": round(float(row["macd_hist"]), 4),
+        "volume": round(float(row["volume"]), 2),
+        "volume_ma": round(float(row["volume_ma"]), 2),
+        "volume_strength": round(volume_strength, 3),
         "reason": reason,
     }
 
@@ -628,7 +721,7 @@ def calc_summary(equity: pd.DataFrame, trades: pd.DataFrame) -> dict[str, object
     }
 
 
-def load_codes_file(path: Path, enabled_only: bool = False) -> list[str]:
+def load_codes_file(path: Path, enabled_only: bool = False, attack_only: bool = False) -> list[str]:
     with path.open(newline="", encoding="utf-8") as fh:
         reader = csv.DictReader(fh)
         if "code" not in (reader.fieldnames or []):
@@ -638,6 +731,8 @@ def load_codes_file(path: Path, enabled_only: bool = False) -> list[str]:
             if not row.get("code"):
                 continue
             if enabled_only and row.get("enabled", "1").strip() not in {"1", "true", "TRUE", "yes", "Y"}:
+                continue
+            if attack_only and row.get("attack", "0").strip() not in {"1", "true", "TRUE", "yes", "Y"}:
                 continue
             codes.append(normalize_code(row["code"]))
         return codes
@@ -651,6 +746,8 @@ def parse_codes(raw: str, codes_file: str | None = None) -> list[str]:
     raw = raw.strip()
     if raw.lower() == "core":
         codes.extend(load_codes_file(ETF_POOL_FILE, enabled_only=True))
+    elif raw.lower() == "attack":
+        codes.extend(load_codes_file(ETF_POOL_FILE, enabled_only=True, attack_only=True))
     elif raw.lower() == "all":
         codes.extend(load_codes_file(ETF_POOL_FILE, enabled_only=False))
     elif raw:
@@ -765,7 +862,9 @@ def run_daily(args: argparse.Namespace) -> None:
             rows.append({"code": code, "action": "ERROR", "reason": str(exc)})
 
     result = pd.DataFrame(rows)
-    if "priority" in result.columns:
+    if "rank_score" in result.columns:
+        result = result.sort_values(["rank_score", "code"], ascending=[False, True])
+    elif "priority" in result.columns:
         result = result.sort_values(["priority", "code"], ascending=[False, True])
     date_label = dt.date.today().strftime("%Y%m%d")
     if "date" in result.columns and result["date"].notna().any():
@@ -787,7 +886,7 @@ def fetch_realtime_spot(asset: str) -> pd.DataFrame:
 
 def run_compare(args: argparse.Namespace) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    variants = ["original", "trend", "trend_exit2", "adaptive"]
+    variants = ["original", "trend", "trend_exit2", "adaptive", "breakout"]
     all_rows = []
     codes = parse_codes(args.codes, args.codes_file)
     data_cache: dict[str, pd.DataFrame] = {}
@@ -835,7 +934,7 @@ def run_walk_forward(args: argparse.Namespace) -> None:
     train_end = args.train_end or "20241231"
     test_start = args.test_start or "20260101"
     test_end = args.test_end or args.end
-    variants = ["original", "trend", "trend_exit2"]
+    variants = ["original", "trend", "trend_exit2", "breakout"]
     rows = []
     codes = parse_codes(args.codes, args.codes_file)
 
@@ -917,6 +1016,193 @@ def run_walk_forward(args: argparse.Namespace) -> None:
     print(result.to_string(index=False))
 
 
+def run_portfolio(args: argparse.Namespace) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    cfg = config_for_profile(args, args.portfolio_strategy)
+    codes = parse_codes(args.codes or "attack", args.codes_file)
+    start = args.portfolio_start or args.start
+    end = args.portfolio_end or args.end
+    frames: dict[str, pd.DataFrame] = {}
+    for code in codes:
+        df = fetch_hist(code, start, end, args.asset, args.data_source, args.adjust, not args.no_cache, args.retries)
+        frames[code] = add_indicators(df, cfg).reset_index(drop=True)
+
+    all_dates = sorted(set().union(*[set(df["date"]) for df in frames.values()]))
+    cash = args.cash
+    positions: dict[str, dict[str, object]] = {}
+    trades: list[dict[str, object]] = []
+    equity_rows: list[dict[str, object]] = []
+
+    for current_date in all_dates:
+        rows: dict[str, tuple[pd.Series, pd.Series]] = {}
+        for code, df in frames.items():
+            loc = df.index[df["date"] == current_date].tolist()
+            if not loc or loc[0] == 0:
+                continue
+            idx = loc[0]
+            row = df.iloc[idx]
+            prev = df.iloc[idx - 1]
+            if pd.isna(row["ma17"]) or pd.isna(prev["ma5"]):
+                continue
+            rows[code] = (row, prev)
+
+        # Sells first.
+        for code in list(positions.keys()):
+            if code not in rows:
+                continue
+            row, _ = rows[code]
+            price = float(row["close"])
+            holding = positions[code]
+            shares = int(holding["shares"])
+            if shares <= 0:
+                continue
+            holding["peak_price"] = max(float(holding.get("peak_price", price)), price)
+            if (
+                cfg.strategy == "breakout"
+                and cfg.trailing_stop > 0
+                and price <= float(holding["peak_price"]) * (1 - cfg.trailing_stop)
+            ):
+                cash = sell_shares(cash, shares, price, cfg)
+                trades.append(
+                    make_portfolio_trade(
+                        current_date,
+                        code,
+                        "SELL_ALL",
+                        shares,
+                        price,
+                        cash,
+                        0,
+                        f"breakout从高点回撤{cfg.trailing_stop:.0%}清仓",
+                    )
+                )
+                del positions[code]
+            elif cfg.strategy == "breakout" and price < row["ma10"]:
+                cash = sell_shares(cash, shares, price, cfg)
+                trades.append(make_portfolio_trade(current_date, code, "SELL_ALL", shares, price, cash, 0, "breakout跌破MA10清仓"))
+                del positions[code]
+            elif price < row["ma17"]:
+                cash = sell_shares(cash, shares, price, cfg)
+                trades.append(make_portfolio_trade(current_date, code, "SELL_ALL", shares, price, cash, 0, "跌破MA17清仓"))
+                del positions[code]
+            elif price < row["ma5"] * (1 - cfg.ma5_break_ratio):
+                sell_count = max(cfg.lot_size, int(shares / 3) // cfg.lot_size * cfg.lot_size)
+                sell_count = min(shares, sell_count)
+                cash = sell_shares(cash, sell_count, price, cfg)
+                holding["shares"] = shares - sell_count
+                trades.append(make_portfolio_trade(current_date, code, "SELL_1_3", sell_count, price, cash, int(holding["shares"]), "低于MA5 10%"))
+                if int(holding["shares"]) <= 0:
+                    del positions[code]
+
+        equity = cash + sum(int(pos["shares"]) * float(rows[code][0]["close"]) for code, pos in positions.items() if code in rows)
+
+        # Add half positions to target 50% when MA17 and volume confirm.
+        for code in list(positions.keys()):
+            if code not in rows:
+                continue
+            pos = positions[code]
+            if pos.get("stage") != "half":
+                continue
+            row, _ = rows[code]
+            if cfg.strategy != "breakout" and row["close"] > row["ma17"] and has_volume_breakout(row, cfg):
+                buy_count, cash = buy_shares_for_target(cash, int(pos["shares"]), float(row["close"]), args.portfolio_slot, cfg)
+                if buy_count > 0:
+                    pos["shares"] = int(pos["shares"]) + buy_count
+                    pos["stage"] = "full"
+                    trades.append(make_portfolio_trade(current_date, code, "BUY_FULL", buy_count, float(row["close"]), cash, int(pos["shares"]), "突破MA17且满足量能"))
+
+        equity = cash + sum(int(pos["shares"]) * float(rows[code][0]["close"]) for code, pos in positions.items() if code in rows)
+
+        # New entries ranked by signal strength.
+        capacity = max(0, args.max_positions - len(positions))
+        candidates = []
+        if capacity > 0:
+            for code, (row, prev) in rows.items():
+                if code in positions:
+                    continue
+                if (
+                    is_entry_signal(row, prev, cfg, cfg.strategy)
+                ):
+                    volume_strength = 0.0 if pd.isna(row["volume_ma"]) or row["volume_ma"] <= 0 else float(row["volume"] / row["volume_ma"])
+                    macd_improve = float(row["macd_hist"] - prev["macd_hist"])
+                    rank_score = max(volume_strength - 1, 0) * 10 + max(macd_improve, 0) * 100
+                    candidates.append((rank_score, code, row))
+        for _, code, row in sorted(candidates, reverse=True)[:capacity]:
+            target = args.portfolio_slot if cfg.strategy == "breakout" else args.portfolio_slot / 2
+            buy_count, cash = buy_shares_for_target(cash, 0, float(row["close"]), target, cfg)
+            if buy_count <= 0:
+                continue
+            positions[code] = {
+                "shares": buy_count,
+                "stage": "full" if cfg.strategy == "breakout" else "half",
+                "peak_price": float(row["close"]),
+            }
+            action = "BUY_FULL" if cfg.strategy == "breakout" else "BUY_HALF"
+            reason = "breakout趋势突破买入" if cfg.strategy == "breakout" else "低位MACD上穿MA5且满足量能"
+            trades.append(make_portfolio_trade(current_date, code, action, buy_count, float(row["close"]), cash, buy_count, reason))
+
+        equity = cash + sum(int(pos["shares"]) * float(rows[code][0]["close"]) for code, pos in positions.items() if code in rows)
+        equity_rows.append(
+            {
+                "date": current_date.date().isoformat(),
+                "cash": round(cash, 2),
+                "equity": round(equity, 2),
+                "positions": ",".join(f"{code}:{pos['shares']}:{pos['stage']}" for code, pos in sorted(positions.items())),
+                "position_count": len(positions),
+            }
+        )
+
+    equity_df = pd.DataFrame(equity_rows)
+    trades_df = pd.DataFrame(trades)
+    slot_label = str(args.portfolio_slot).replace(".", "p")
+    prefix = f"portfolio_{args.portfolio_strategy}_{start}_{end}_m{args.max_positions}_s{slot_label}"
+    if args.portfolio_strategy == "breakout":
+        volume_label = str(args.breakout_volume_ratio).replace(".", "p")
+        prefix = f"{prefix}_bw{args.breakout_window}_vr{volume_label}"
+    equity_df.to_csv(OUTPUT_DIR / f"{prefix}_equity.csv", index=False)
+    trades_df.to_csv(OUTPUT_DIR / f"{prefix}_trades.csv", index=False)
+    if equity_df.empty:
+        print("No equity rows")
+        return
+    curve = equity_df["equity"].astype(float)
+    summary = {
+        "start": equity_df.iloc[0]["date"],
+        "end": equity_df.iloc[-1]["date"],
+        "initial_cash": args.cash,
+        "end_equity": round(float(curve.iloc[-1]), 2),
+        "total_return": f"{float(curve.iloc[-1]) / args.cash - 1:.2%}",
+        "max_drawdown": f"{(curve / curve.cummax() - 1).min():.2%}",
+        "trade_count": len(trades_df),
+        "max_positions": args.max_positions,
+        "slot": args.portfolio_slot,
+    }
+    pd.DataFrame([summary]).to_csv(OUTPUT_DIR / f"{prefix}_summary.csv", index=False)
+    print(pd.Series(summary).to_string())
+    print(f"trades: {OUTPUT_DIR / f'{prefix}_trades.csv'}")
+    print(f"equity: {OUTPUT_DIR / f'{prefix}_equity.csv'}")
+
+
+def make_portfolio_trade(
+    date: pd.Timestamp,
+    code: str,
+    action: str,
+    shares: int,
+    price: float,
+    cash: float,
+    holding: int,
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "date": date.date().isoformat(),
+        "code": code,
+        "action": action,
+        "shares": shares,
+        "price": round(price, 3),
+        "cash_after": round(cash, 2),
+        "holding_after": holding,
+        "reason": reason,
+    }
+
+
 def select_best_variants(result: pd.DataFrame) -> pd.DataFrame:
     if result.empty or "total_return" not in result.columns:
         return pd.DataFrame()
@@ -964,15 +1250,24 @@ def profile_for_variant(variant: str, code: str) -> str:
 
 
 def config_for_profile(args: argparse.Namespace, profile: str) -> StrategyConfig:
+    volume_ratio = args.volume_ratio
     if profile == "original":
         trend_filter = False
         ma17_exit_days = 1
+        strategy = "rebound"
     elif profile == "trend":
         trend_filter = True
         ma17_exit_days = 1
+        strategy = "rebound"
     elif profile == "trend_exit2":
         trend_filter = True
         ma17_exit_days = 2
+        strategy = "rebound"
+    elif profile == "breakout":
+        trend_filter = False
+        ma17_exit_days = 1
+        strategy = "breakout"
+        volume_ratio = args.breakout_volume_ratio
     else:
         raise ValueError(f"不支持的策略配置：{profile}")
 
@@ -985,19 +1280,24 @@ def config_for_profile(args: argparse.Namespace, profile: str) -> StrategyConfig
         macd_fast=args.macd_fast,
         macd_slow=args.macd_slow,
         macd_signal=args.macd_signal,
+        volume_window=args.volume_window,
+        volume_ratio=volume_ratio,
+        breakout_window=args.breakout_window,
+        trailing_stop=args.trailing_stop,
         trend_filter=trend_filter,
         ma17_exit_days=ma17_exit_days,
+        strategy=strategy,
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="A股ETF MACD低位 + MA5上穿策略")
-    parser.add_argument("--mode", choices=["backtest", "signal", "daily", "compare", "walk_forward"], default="backtest")
+    parser.add_argument("--mode", choices=["backtest", "signal", "daily", "compare", "walk_forward", "portfolio"], default="backtest")
     parser.add_argument(
         "--variant",
-        choices=["original", "trend", "trend_exit2", "adaptive"],
+        choices=["original", "trend", "trend_exit2", "adaptive", "breakout"],
         default="original",
-        help="策略版本：original原始；trend加趋势过滤；trend_exit2再加连续2天跌破MA17清仓；adaptive按ETF类型选择",
+        help="策略版本：original原始；trend加趋势过滤；trend_exit2再加连续2天跌破MA17清仓；breakout趋势突破；adaptive按ETF类型选择",
     )
     parser.add_argument("--asset", choices=["etf", "stock"], default="etf", help="资产类型，默认ETF")
     parser.add_argument(
@@ -1006,7 +1306,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="akshare",
         help="历史行情数据源；akshare 默认带 sina 兜底",
     )
-    parser.add_argument("--codes", default="", help="ETF代码，多个用逗号分隔；core使用启用池；all使用全量池")
+    parser.add_argument("--codes", default="", help="ETF代码，多个用逗号分隔；core使用启用池；attack使用进攻池；all使用全量池")
     parser.add_argument("--codes-file", help="ETF池CSV文件，必须包含 code 列")
     parser.add_argument("--positions", default=str(POSITIONS_FILE), help="daily模式持仓CSV文件")
     parser.add_argument("--start", default="20200101")
@@ -1020,6 +1320,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--macd-fast", type=int, default=12, help="MACD快线EMA周期")
     parser.add_argument("--macd-slow", type=int, default=26, help="MACD慢线EMA周期")
     parser.add_argument("--macd-signal", type=int, default=9, help="MACD信号线DEA周期")
+    parser.add_argument("--volume-window", type=int, default=5, help="放量判断的成交量均线周期")
+    parser.add_argument("--volume-ratio", type=float, default=0.8, help="放量倍数，默认成交量大于5日均量0.8倍")
+    parser.add_argument("--breakout-window", type=int, default=20, help="breakout突破新高窗口")
+    parser.add_argument("--breakout-volume-ratio", type=float, default=1.2, help="breakout专用放量倍数，默认成交量大于5日均量1.2倍")
+    parser.add_argument("--trailing-stop", type=float, default=0.10, help="预留移动止盈回撤比例")
     parser.add_argument("--realtime", action="store_true", help="signal模式使用实时价更新最后一根K线")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--retries", type=int, default=3, help="行情接口失败重试次数")
@@ -1027,6 +1332,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train-end", help="walk_forward训练结束日期，例如 20241231")
     parser.add_argument("--test-start", help="walk_forward验证开始日期，例如 20260101")
     parser.add_argument("--test-end", help="walk_forward验证结束日期，例如 20260621")
+    parser.add_argument("--portfolio-start", help="portfolio组合回测开始日期，例如 20250101")
+    parser.add_argument("--portfolio-end", help="portfolio组合回测结束日期，例如 20251231")
+    parser.add_argument(
+        "--portfolio-strategy",
+        choices=["original", "breakout"],
+        default="original",
+        help="portfolio组合策略：original低位反弹；breakout趋势突破",
+    )
+    parser.add_argument("--max-positions", type=int, default=2, help="portfolio最多同时持有ETF数量")
+    parser.add_argument("--portfolio-slot", type=float, default=0.5, help="portfolio单只ETF目标仓位比例")
     return parser
 
 
@@ -1042,6 +1357,8 @@ def main(argv: Iterable[str] | None = None) -> int:
             run_daily(args)
         elif args.mode == "walk_forward":
             run_walk_forward(args)
+        elif args.mode == "portfolio":
+            run_portfolio(args)
         else:
             run_compare(args)
     except Exception as exc:
