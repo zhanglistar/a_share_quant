@@ -1,0 +1,5 @@
+variant,tested,avg_return,median_return,win_rate,avg_drawdown,worst_drawdown,avg_trades
+adaptive,21,41.53%,24.85%,100.00%,-13.96%,-25.35%,73.2
+original,24,35.80%,13.10%,83.33%,-17.46%,-53.91%,84.3
+trend,24,2.10%,-0.33%,41.67%,-8.35%,-49.93%,10.5
+trend_exit2,24,3.98%,-0.06%,41.67%,-9.48%,-50.14%,9.0
