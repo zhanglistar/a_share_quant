@@ -14,7 +14,7 @@ code,shares,entry_date,position_stage,notes
 
 `position_stage`：
 
-- `half`：已按信号买入目标半仓，次日若仍站上 MA5 会提示 `BUY_FULL`。
+- `half`：已按信号买入目标半仓，后续若突破/站上 MA17 会提示 `BUY_FULL`。
 - `full`：已加到目标满仓。
 
 没有持仓就只保留表头。
@@ -42,7 +42,7 @@ signals/YYYYMMDD_daily_signals.csv
 ## 动作含义
 
 - `BUY_HALF`：无持仓，低位 MACD 且上穿 MA5，买入目标半仓。
-- `BUY_FULL`：已有半仓，今日仍站上 MA5，加到目标满仓。
+- `BUY_FULL`：已有半仓，今日突破/站上 MA17，加到目标满仓。
 - `SELL_1_3`：低于 MA5 10%，卖出当前持仓 1/3。
 - `SELL_ALL`：跌破 MA17，清仓。
 - `HOLD`：无动作。

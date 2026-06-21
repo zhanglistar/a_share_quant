@@ -447,12 +447,12 @@ def backtest(df: pd.DataFrame, code: str, cfg: StrategyConfig) -> tuple[pd.DataF
                 trades.append(make_trade(code, date, action, buy_count, price, cash, shares, reason))
 
         elif shares > 0 and pending_add_date is not None and date == pending_add_date:
-            if price > row["ma5"]:
+            if price > row["ma17"]:
                 buy_count, cash = buy_shares_for_target(cash, shares, price, 1.0, cfg)
                 if buy_count > 0:
                     shares += buy_count
                     action = "BUY_FULL"
-                    reason = "次日仍站上MA5"
+                    reason = "次日突破MA17"
                     trades.append(make_trade(code, date, action, buy_count, price, cash, shares, reason))
             pending_add_date = None
 
@@ -517,8 +517,8 @@ def signal_for_latest(df: pd.DataFrame, code: str, cfg: StrategyConfig) -> dict[
     signals: list[str] = []
     if passes_trend_filter(row, cfg) and cross_above_ma5(row, prev) and is_low_macd(row, prev, cfg):
         signals.append("BUY_HALF: 低位MACD且价格上穿MA5")
-    if row["close"] > row["ma5"]:
-        signals.append("ADD_OK: 若昨日已半仓，今日仍站上MA5，可加到满仓")
+    if row["close"] > row["ma17"]:
+        signals.append("ADD_OK: 若昨日已半仓，今日突破MA17，可加到满仓")
     if row["close"] < row["ma5"] * (1 - cfg.ma5_break_ratio):
         signals.append(f"SELL_1_3: 低于MA5 {cfg.ma5_break_ratio:.0%}")
     if row["close"] < row["ma17"]:
@@ -583,9 +583,9 @@ def daily_action_for_code(
         action = "SELL_1_3"
         reason = f"低于MA5 {cfg.ma5_break_ratio:.0%}，卖出1/3"
         priority = 90
-    elif shares > 0 and stage.lower() in {"half", "buy_half", "50", "0.5"} and row["close"] > row["ma5"]:
+    elif shares > 0 and stage.lower() in {"half", "buy_half", "50", "0.5"} and row["close"] > row["ma17"]:
         action = "BUY_FULL"
-        reason = "已半仓且仍站上MA5，加到目标满仓"
+        reason = "已半仓且突破MA17，加到目标满仓"
         priority = 80
     elif shares == 0 and passes_trend_filter(row, cfg) and cross_above_ma5(row, prev) and is_low_macd(row, prev, cfg):
         action = "BUY_HALF"
